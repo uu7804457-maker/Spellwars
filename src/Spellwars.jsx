@@ -585,6 +585,14 @@ function LetterPickerScreen({ book, player, onPick }) {
   );
 }
 
+function filledFlags(letters, cost) {
+  const remaining = { ...letters };
+  return cost.map((ch) => {
+    if ((remaining[ch] || 0) > 0) { remaining[ch] -= 1; return true; }
+    return false;
+  });
+}
+
 function paginateSpells(spells) {
   const ultra = spells.slice(-3);
   const regular = spells.slice(0, -3);
@@ -649,6 +657,7 @@ function GrimoirePanel({ player, others, isInteractive, silenced, onCast, onPass
           {current.spells.map((spell) => {
             const affordable = canCast(player.letters, spell.cost, player.nextCostDiscount);
             const disabled = !isInteractive || !affordable || silenced;
+            const flags = filledFlags(player.letters, spell.cost);
             return (
               <button key={spell.id} disabled={disabled} onClick={() => handleCastClick(spell)}
                 className={`w-full text-left border rounded px-3 py-2 flex items-center justify-between transition ${!disabled ? "border-[#221E2C] hover:bg-[#221E2C]/5" : "border-[#c9c2b0] opacity-40"}`}>
@@ -657,7 +666,14 @@ function GrimoirePanel({ player, others, isInteractive, silenced, onCast, onPass
                   <div className="text-[10px] text-[#6b6558]">{spell.origin} ・ {effectLabel(spell)}</div>
                 </div>
                 <div className="flex gap-1 flex-wrap justify-end max-w-[40%]">
-                  {spell.cost.map((c, i) => <span key={i} className="text-xs font-mono border border-current rounded px-1">{c}</span>)}
+                  {spell.cost.map((c, i) => (
+                    <span
+                      key={i}
+                      className={`text-xs font-mono rounded px-1 ${flags[i] ? "bg-[#221E2C] text-[#EDE6D6] border border-[#221E2C]" : "border border-current"}`}
+                    >
+                      {c}
+                    </span>
+                  ))}
                 </div>
               </button>
             );
