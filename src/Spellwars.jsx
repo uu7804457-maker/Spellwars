@@ -214,9 +214,51 @@ function payCost(letters, cost) {
   return next;
 }
 
+// Finds the letter type that best "snipes" toward the nearest-to-castable spell.
+// Falls back to uniform random from the book's pool if everything is already castable.
+function bestSnipeLetter(book, letters) {
+  let bestMissing = Infinity;
+  let candidates = [];
+  for (const spell of book.spells) {
+    const need = costToCounts(spell.cost);
+    let missing = 0;
+    const missingChars = [];
+    for (const [ch, n] of Object.entries(need)) {
+      const have = letters[ch] || 0;
+      if (n > have) { missing += n - have; missingChars.push(...Array(n - have).fill(ch)); }
+    }
+    if (missing > 0 && missing < bestMissing) { bestMissing = missing; candidates = missingChars; }
+    else if (missing > 0 && missing === bestMissing) { candidates.push(...missingChars); }
+  }
+  if (candidates.length === 0) return book.pool[Math.floor(Math.random() * book.pool.length)];
+  return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+// Caps kept letters at 20 units when moving into a new set. If the player holds
+// 20 or fewer already, everything carries over with no need to choose.
+function selectKeptLetters(letters, keptList) {
+  const totalHeld = Object.values(letters).reduce((a, b) => a + b, 0);
+  if (totalHeld <= 20) return { ...letters };
+  return costToCounts(keptList);
+}
+
+// Resets everything except identity/letters/eliminated for a fresh set.
+function resetPlayerForNewSet(player, baseMaxHp, keptLetters) {
+  return {
+    name: player.name, book: player.book, eliminated: player.eliminated || false,
+    hp: baseMaxHp, maxHp: baseMaxHp, letters: keptLetters,
+    shieldCharges: 0, reflect: false, invincible: false,
+    stunnedTurns: 0, silencedTurns: 0, drawPenalty: 0,
+    reviveCharge: false, nextPowerBoost: false, nextCostDiscount: false,
+    invincibleRounds: 0, untargetableRounds: 0, stealImmuneRounds: 0,
+    drawBonus: 0, pendingMaxHpBoost: null, healOthersPending: null,
+    growthActive: false, growthTicker: 0,
+  };
+}
+
 function makePlayer(name, book, maxHp) {
   return {
-    name, book, hp: maxHp, maxHp, letters: {},
+    name, book, hp: maxHp, maxHp, letters: {}, eliminated: false,
     shieldCharges: 0, reflect: false, invincible: false,
     stunnedTurns: 0, silencedTurns: 0, drawPenalty: 0,
     reviveCharge: false, nextPowerBoost: false, nextCostDiscount: false,
@@ -268,7 +310,14 @@ function applyEffects(playersIn, casterIdx, targetIdx, spell, globalDebuffImmune
         if (t.stealImmuneRounds > 0) { msg += ` → ${t.name}は文字を奪われない`; break; }
         const owned = Object.entries(t.letters).filter(([, n]) => n > 0);
         if (owned.length === 0) { msg += ` → ${t.name}は文字を持たず不発`; }
-        else { const [ch] = owned[Math.floor(Math.random() * owned.length)]; list[targetIdx] = { ...t, letters: { ...t.letters, [ch]: t.letters[ch] - 1 } }; list[casterIdx] = { ...list[casterIdx], letters: { ...list[casterIdx].letters, [ch]: (list[casterIdx].letters[ch] || 0) + 1 } }; msg += ` → ${t.name}から「${ch}」を奪った`; }
+        else {
+          const [stolenCh] = owned[Math.floor(Math.random() * owned.length)];
+          list[targetIdx] = { ...t, letters: { ...t.letters, [stolenCh]: t.letters[stolenCh] - 1 } };
+          const casterBook = BOOKS[list[casterIdx].book];
+          const gainedCh = bestSnipeLetter(casterBook, list[casterIdx].letters);
+          list[casterIdx] = { ...list[casterIdx], letters: { ...list[casterIdx].letters, [gainedCh]: (list[casterIdx].letters[gainedCh] || 0) + 1 } };
+          msg += ` → ${t.name}から文字を奪い、自分の書の「${gainedCh}」に変換して獲得`;
+        }
         break;
       }
       case "remove_letter_random": {
@@ -493,6 +542,49 @@ function HpStrip({ players, highlightIdx }) {
 // Presentational panel shared by hotseat + online. Renders the active player's
 // grimoire page. If isInteractive=false it renders a read-only waiting view.
 const SPELLS_PER_PAGE = 5;
+function LetterKeepScreen({ book, player, onConfirm }) {
+  const [kept, setKept] = useState({});
+  const totalKept = Object.values(kept).reduce((a, b) => a + b, 0);
+  const owned = Object.entries(player.letters).filter(([, n]) => n > 0);
+  const inc = (ch) => { if (totalKept >= 20) return; if ((kept[ch] || 0) >= (player.letters[ch] || 0)) return; setKept((k) => ({ ...k, [ch]: (k[ch] || 0) + 1 })); };
+  const dec = (ch) => setKept((k) => ({ ...k, [ch]: Math.max(0, (k[ch] || 0) - 1) }));
+  return (
+    <div className="min-h-screen w-full bg-[#0A0910] flex items-center justify-center px-4">
+      <div style={{ borderColor: book.accent }} className="max-w-md w-full bg-[#EDE6D6] text-[#221E2C] rounded-lg border-2 p-6">
+        <div style={{ fontFamily: "'Cinzel', serif", color: book.accent }} className="text-lg mb-1 text-center">{player.name}</div>
+        <div className="text-xs text-[#6b6558] mb-4 text-center">持ち越す文字を20個まで選んでください({totalKept} / 20)</div>
+        <div className="flex flex-wrap gap-2 justify-center mb-6">
+          {owned.map(([ch, n]) => (
+            <div key={ch} style={{ borderColor: book.accent }} className="border rounded px-2 py-1 flex items-center gap-2">
+              <button onClick={() => dec(ch)} className="text-sm px-1">-</button>
+              <span className="font-mono text-sm">{ch} {kept[ch] || 0}/{n}</span>
+              <button onClick={() => inc(ch)} className="text-sm px-1">+</button>
+            </div>
+          ))}
+        </div>
+        <button onClick={() => onConfirm(kept)} className="w-full py-2 rounded bg-[#C9A227] text-[#100E17] tracking-widest font-semibold">確定</button>
+      </div>
+    </div>
+  );
+}
+
+function LetterPickerScreen({ book, player, onPick }) {
+  const uniqueLetters = [...new Set(book.pool)];
+  return (
+    <div className="min-h-screen w-full bg-[#0A0910] flex items-center justify-center px-4">
+      <div style={{ borderColor: book.accent }} className="max-w-md w-full bg-[#EDE6D6] text-[#221E2C] rounded-lg border-2 p-6 text-center">
+        <div style={{ fontFamily: "'Cinzel', serif", color: book.accent }} className="text-lg mb-1">{player.name}</div>
+        <div className="text-xs text-[#6b6558] mb-4">ランダム取得に加えて、好きな文字を1つ選べます</div>
+        <div className="flex flex-wrap gap-2 justify-center">
+          {uniqueLetters.map((ch) => (
+            <button key={ch} onClick={() => onPick(ch)} style={{ borderColor: book.accent }} className="border rounded px-3 py-2 font-mono text-lg hover:bg-black/5">{ch}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function paginateSpells(spells) {
   const ultra = spells.slice(-3);
   const regular = spells.slice(0, -3);
@@ -509,6 +601,7 @@ function GrimoirePanel({ player, others, isInteractive, silenced, onCast, onPass
   const [page, setPage] = useState(0);
   const pages = paginateSpells(book.spells);
   const current = pages[Math.min(page, pages.length - 1)];
+  const castableCount = book.spells.filter((s) => canCast(player.letters, s.cost, player.nextCostDiscount)).length;
 
   const handleCastClick = (spell) => {
     if (needsTarget(spell)) setTargeting(spell);
@@ -527,7 +620,10 @@ function GrimoirePanel({ player, others, isInteractive, silenced, onCast, onPass
       {stampBook && <SealStamp book={stampBook} />}
       <div className="flex items-center justify-between mb-4">
         <div style={{ fontFamily: "'Cinzel', serif", color: book.accent }} className="text-xl">{book.name}</div>
-        <div className="text-xs text-[#6b6558]">{player.name}</div>
+        <div className="text-right">
+          <div className="text-xs text-[#6b6558]">{player.name}</div>
+          <div className="text-[10px]" style={{ color: book.accent }}>発動可能: {castableCount} / {book.spells.length}</div>
+        </div>
       </div>
 
       <div className="mb-4">
@@ -706,6 +802,10 @@ function HotseatGame({ onExit }) {
   const [log, setLog] = useState("");
   const [slotsLeft, setSlotsLeft] = useState(0);
   const [globalDebuff, setGlobalDebuff] = useState(0);
+  const [baseMaxHp, setBaseMaxHp] = useState(150);
+  const [setNumber, setSetNumber] = useState(1);
+  const [setQueue, setSetQueue] = useState([]); // survivor indices still needing to confirm kept letters
+  const [keptMap, setKeptMap] = useState({}); // idx -> chosen kept letters object
 
   const beginTurnFor = (list, startIdx, gDebuff, slots) => {
     let cur = list.map((p) => ({ ...p }));
@@ -730,13 +830,41 @@ function HotseatGame({ onExit }) {
   };
 
   const startGame = (initPlayers) => {
+    const bhp = initPlayers[0].maxHp;
+    setBaseMaxHp(bhp); setSetNumber(1);
     const r = beginTurnFor(initPlayers, 0, 0, aliveCount(initPlayers));
-    setPlayers(r.list); setActiveIdx(r.idx); setLog(r.log); setGlobalDebuff(r.globalDebuff); setSlotsLeft(r.slotsLeft); setPhase("turn");
+    setPlayers(r.list); setActiveIdx(r.idx); setLog(r.log); setGlobalDebuff(r.globalDebuff); setSlotsLeft(r.slotsLeft); setPhase("picking");
   };
   const openHandoff = () => {
     const r = beginTurnFor(players, activeIdx, globalDebuff, slotsLeft);
-    setPlayers(r.list); setActiveIdx(r.idx); setLog(r.log); setGlobalDebuff(r.globalDebuff); setSlotsLeft(r.slotsLeft); setPhase("turn");
+    setPlayers(r.list); setActiveIdx(r.idx); setLog(r.log); setGlobalDebuff(r.globalDebuff); setSlotsLeft(r.slotsLeft); setPhase("picking");
   };
+  const onLetterPick = (ch) => {
+    const list = players.map((p, i) => (i === activeIdx ? { ...p, letters: { ...p.letters, [ch]: (p.letters[ch] || 0) + 1 } } : p));
+    setPlayers(list); setPhase("turn");
+  };
+
+  const startSetTransition = (list, deadNames) => {
+    const survivors = list.map((p, i) => i).filter((i) => list[i].hp > 0);
+    setPlayers(list);
+    setSetQueue(survivors);
+    setKeptMap({});
+    setLog(`${deadNames}が力尽きた → セット${setNumber + 1}へ`);
+    setPhase("setTransitionHandoff");
+  };
+
+  const finalizeSetTransition = (finalKeptMap) => {
+    const list = players.map((p, i) => {
+      if (p.hp <= 0) return p; // eliminated, frozen forever
+      const kept = selectKeptLetters(p.letters, finalKeptMap[i] ? Object.entries(finalKeptMap[i]).flatMap(([ch, n]) => Array(n).fill(ch)) : []);
+      return resetPlayerForNewSet(p, baseMaxHp, kept);
+    });
+    setSetNumber((n) => n + 1);
+    const firstIdx = list.map((p, i) => i).find((i) => list[i].hp > 0);
+    const r = beginTurnFor(list, firstIdx, 0, aliveCount(list));
+    setPlayers(r.list); setActiveIdx(r.idx); setLog(r.log); setGlobalDebuff(0); setSlotsLeft(r.slotsLeft); setPhase("picking");
+  };
+
   const finishTurn = (list, fromIdx, gDebuff, slots) => {
     const r = consumeSlot(list, gDebuff, slots);
     if (aliveCount(r.list) <= 1) { setPlayers(r.list); setGlobalDebuff(r.globalDebuffImmuneRounds); setSlotsLeft(r.slotsLeft); setPhase("gameover"); return; }
@@ -744,20 +872,29 @@ function HotseatGame({ onExit }) {
     setPlayers(r.list); setActiveIdx(ni); setGlobalDebuff(r.globalDebuffImmuneRounds); setSlotsLeft(r.slotsLeft); setPhase("handoff");
   };
 
+  const handleOutcome = (list, msg, gDebuff, hasExtraTurn, fromIdx, slots) => {
+    const prevAlive = aliveCount(players);
+    const newAlive = aliveCount(list);
+    if (newAlive <= 1) { setPlayers(list); setLog(msg); setGlobalDebuff(gDebuff); setPhase("gameover"); return; }
+    if (newAlive < prevAlive) {
+      const deadNames = players.filter((p, i) => p.hp > 0 && list[i].hp <= 0).map((p) => p.name).join("・");
+      startSetTransition(list, deadNames);
+      return;
+    }
+    if (hasExtraTurn) { setPlayers(list); setLog(msg); setGlobalDebuff(gDebuff); return; }
+    setLog(msg);
+    finishTurn(list, fromIdx, gDebuff, slots);
+  };
+
   const onCast = (spell, targetIdx) => {
     const { list, msg, hasExtraTurn, globalDebuffImmuneRounds } = applyEffects(players, activeIdx, targetIdx, spell, globalDebuff);
-    const paid = { ...list[activeIdx], letters: payCost(list[activeIdx].letters, spell.cost) };
-    list[activeIdx] = paid;
-    if (aliveCount(list) <= 1) { setPlayers(list); setLog(msg); setGlobalDebuff(globalDebuffImmuneRounds); setPhase("gameover"); return; }
-    if (hasExtraTurn) { setPlayers(list); setLog(msg); setGlobalDebuff(globalDebuffImmuneRounds); return; }
-    setLog(msg);
-    finishTurn(list, activeIdx, globalDebuffImmuneRounds, slotsLeft);
+    list[activeIdx] = { ...list[activeIdx], letters: payCost(list[activeIdx].letters, spell.cost) };
+    handleOutcome(list, msg, globalDebuffImmuneRounds, hasExtraTurn, activeIdx, slotsLeft);
   };
   const onPass = () => {
     let list = players.map((p) => ({ ...p }));
     if (list[activeIdx].silencedTurns > 0) list[activeIdx] = { ...list[activeIdx], silencedTurns: list[activeIdx].silencedTurns - 1 };
-    setLog(`${list[activeIdx].name} は発動せずターンを終えた`);
-    finishTurn(list, activeIdx, globalDebuff, slotsLeft);
+    handleOutcome(list, `${list[activeIdx].name} は発動せずターンを終えた`, globalDebuff, false, activeIdx, slotsLeft);
   };
 
   if (phase === "setup" || !players) return <HotseatSetup onStart={startGame} onBack={onExit} />;
@@ -766,11 +903,49 @@ function HotseatGame({ onExit }) {
     return <GameOverScreen winner={alive.length === 1 ? alive[0] : null} onRestart={() => { setPlayers(null); setPhase("setup"); }} />;
   }
   if (phase === "handoff") return <HandoffScreen player={players[activeIdx]} onOpen={openHandoff} />;
+  if (phase === "picking") return <LetterPickerScreen book={BOOKS[players[activeIdx].book]} player={players[activeIdx]} onPick={onLetterPick} />;
+
+  if (phase === "setTransitionHandoff") {
+    const idx = setQueue[0];
+    const p = players[idx];
+    const needsPick = Object.values(p.letters).reduce((a, b) => a + b, 0) > 20;
+    return (
+      <HandoffScreen
+        player={p}
+        onOpen={() => {
+          if (needsPick) { setPhase("setTransitionPick"); return; }
+          const nextKeptMap = { ...keptMap, [idx]: {} };
+          setKeptMap(nextKeptMap);
+          const rest = setQueue.slice(1);
+          if (rest.length === 0) finalizeSetTransition(nextKeptMap);
+          else { setSetQueue(rest); setPhase("setTransitionHandoff"); }
+        }}
+      />
+    );
+  }
+  if (phase === "setTransitionPick") {
+    const idx = setQueue[0];
+    const p = players[idx];
+    return (
+      <LetterKeepScreen
+        book={BOOKS[p.book]}
+        player={p}
+        onConfirm={(kept) => {
+          const nextKeptMap = { ...keptMap, [idx]: kept };
+          setKeptMap(nextKeptMap);
+          const rest = setQueue.slice(1);
+          if (rest.length === 0) { finalizeSetTransition(nextKeptMap); }
+          else { setSetQueue(rest); setPhase("setTransitionHandoff"); }
+        }}
+      />
+    );
+  }
 
   const me = players[activeIdx];
   const others = players.map((p, i) => ({ ...p, idx: i })).filter((p) => p.idx !== activeIdx && p.hp > 0 && !(p.untargetableRounds > 0));
   return (
     <div className="min-h-screen w-full bg-[#0A0910] px-4 py-6">
+      <div className="text-center text-[10px] text-[#8b8578] mb-1 tracking-widest">セット {setNumber}</div>
       {globalDebuff > 0 && <div className="text-center text-xs text-[#C9A227] mb-2 tracking-widest">全体デバフ無効化中(残り{globalDebuff}巡)</div>}
       <HpStrip players={players} highlightIdx={activeIdx} />
       <GrimoirePanel key={activeIdx} player={me} others={others} isInteractive={true} silenced={me.silencedTurns > 0} onCast={onCast} onPass={onPass} log={log} />
@@ -875,6 +1050,140 @@ function LobbyScreen({ code, room, isHost, onStart, onRefresh }) {
   );
 }
 
+function ChatTradePanel({ room, mySlot, code, fetchRoom, writeRoom, others }) {
+  const [chatText, setChatText] = useState("");
+  const [tradeOpen, setTradeOpen] = useState(false);
+  const [tradeTarget, setTradeTarget] = useState(others[0]?.idx ?? null);
+  const [giveChar, setGiveChar] = useState("");
+  const [wantChar, setWantChar] = useState("");
+  const [sacrificing, setSacrificing] = useState(null); // trade id being responded to
+
+  const me = room.players[mySlot];
+  const book = BOOKS[me.book];
+  const ownedLetters = Object.entries(me.letters).filter(([, n]) => n > 0);
+  const uniquePool = [...new Set(book.pool)];
+  const chatLog = room.chatLog || [];
+  const trades = room.trades || [];
+  const incoming = trades.filter((t) => t.toIdx === mySlot && t.status === "pending");
+  const outgoing = trades.filter((t) => t.fromIdx === mySlot && t.status === "pending");
+
+  const sendChat = async () => {
+    if (!chatText.trim()) return;
+    const fresh = (await fetchRoom(code)) || room;
+    const nextLog = [...(fresh.chatLog || []), { from: me.name, text: chatText.trim(), ts: Date.now() }].slice(-50);
+    await writeRoom(code, { ...fresh, chatLog: nextLog });
+    setChatText("");
+  };
+
+  const sendTrade = async () => {
+    if (!giveChar || !wantChar || tradeTarget == null) return;
+    const fresh = (await fetchRoom(code)) || room;
+    const proposal = { id: `${Date.now()}_${mySlot}`, fromIdx: mySlot, toIdx: tradeTarget, giveChar, wantChar, status: "pending" };
+    const nextTrades = [...(fresh.trades || []), proposal];
+    const nextLog = [...(fresh.chatLog || []), { from: "system", text: `${me.name}が${room.players[tradeTarget].name}に交渉を持ちかけた(${giveChar}を渡し${wantChar}を要求)`, ts: Date.now() }].slice(-50);
+    await writeRoom(code, { ...fresh, trades: nextTrades, chatLog: nextLog });
+    setTradeOpen(false); setGiveChar(""); setWantChar("");
+  };
+
+  const decline = async (tradeId) => {
+    const fresh = (await fetchRoom(code)) || room;
+    const nextTrades = (fresh.trades || []).map((t) => (t.id === tradeId ? { ...t, status: "declined" } : t));
+    await writeRoom(code, { ...fresh, trades: nextTrades });
+  };
+
+  const accept = async (tradeId, sacrificeChar) => {
+    const fresh = (await fetchRoom(code)) || room;
+    const trade = (fresh.trades || []).find((t) => t.id === tradeId);
+    if (!trade || trade.status !== "pending") { setSacrificing(null); return; }
+    const list = fresh.players.map((p) => ({ ...p }));
+    const proposer = list[trade.fromIdx];
+    const target = list[trade.toIdx];
+    if ((proposer.letters[trade.giveChar] || 0) < 1 || (target.letters[sacrificeChar] || 0) < 1) { setSacrificing(null); return; }
+    proposer.letters = { ...proposer.letters, [trade.giveChar]: proposer.letters[trade.giveChar] - 1 };
+    const targetBook = BOOKS[target.book];
+    const gainedForTarget = targetBook.pool[Math.floor(Math.random() * targetBook.pool.length)];
+    target.letters = { ...target.letters, [gainedForTarget]: (target.letters[gainedForTarget] || 0) + 1 };
+    target.letters = { ...target.letters, [sacrificeChar]: target.letters[sacrificeChar] - 1 };
+    proposer.letters = { ...proposer.letters, [trade.wantChar]: (proposer.letters[trade.wantChar] || 0) + 1 };
+    const nextTrades = fresh.trades.map((t) => (t.id === tradeId ? { ...t, status: "accepted" } : t));
+    const nextLog = [...(fresh.chatLog || []), { from: "system", text: `${target.name}が交渉を承諾。${proposer.name}⇄${target.name}で文字を交換した`, ts: Date.now() }].slice(-50);
+    await writeRoom(code, { ...fresh, players: list, trades: nextTrades, chatLog: nextLog });
+    setSacrificing(null);
+  };
+
+  return (
+    <div className="max-w-xl mx-auto mt-4 bg-[#1B1826] border border-[#3a3550] rounded-lg p-4 text-xs">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-[#8b8578] tracking-widest">チャット・交渉</div>
+        <button onClick={() => setTradeOpen((o) => !o)} className="text-[#C9A227] border border-[#C9A227] rounded px-2 py-0.5">交渉を持ちかける</button>
+      </div>
+
+      {tradeOpen && (
+        <div className="border border-[#3a3550] rounded p-3 mb-3 space-y-2">
+          <div className="flex gap-2 items-center">
+            <span className="text-[#8b8578]">相手:</span>
+            <select value={tradeTarget ?? ""} onChange={(e) => setTradeTarget(Number(e.target.value))} className="bg-[#100E17] text-[#EDE6D6] border border-[#3a3550] rounded px-1">
+              {others.map((o) => <option key={o.idx} value={o.idx}>{o.name}</option>)}
+            </select>
+          </div>
+          <div className="flex gap-2 items-center flex-wrap">
+            <span className="text-[#8b8578]">あげる文字:</span>
+            {ownedLetters.map(([ch, n]) => (
+              <button key={ch} onClick={() => setGiveChar(ch)} className={`font-mono border rounded px-1.5 ${giveChar === ch ? "border-[#C9A227] text-[#C9A227]" : "border-[#3a3550] text-[#EDE6D6]"}`}>{ch}×{n}</button>
+            ))}
+          </div>
+          <div className="flex gap-2 items-center flex-wrap">
+            <span className="text-[#8b8578]">欲しい文字:</span>
+            {uniquePool.map((ch) => (
+              <button key={ch} onClick={() => setWantChar(ch)} className={`font-mono border rounded px-1.5 ${wantChar === ch ? "border-[#C9A227] text-[#C9A227]" : "border-[#3a3550] text-[#EDE6D6]"}`}>{ch}</button>
+            ))}
+          </div>
+          <button onClick={sendTrade} disabled={!giveChar || !wantChar} className="w-full py-1.5 rounded bg-[#C9A227] text-[#100E17] font-semibold disabled:opacity-40">送信</button>
+        </div>
+      )}
+
+      {incoming.length > 0 && (
+        <div className="mb-3 space-y-2">
+          {incoming.map((t) => (
+            <div key={t.id} className="border border-[#C9A227] rounded p-2">
+              <div className="text-[#EDE6D6] mb-1">{room.players[t.fromIdx].name}から: {t.giveChar}をあげるので{t.wantChar}をください</div>
+              {sacrificing === t.id ? (
+                <div className="flex gap-1 flex-wrap items-center">
+                  <span className="text-[#8b8578]">渡す文字を選択:</span>
+                  {ownedLetters.map(([ch, n]) => (
+                    <button key={ch} onClick={() => accept(t.id, ch)} className="font-mono border border-[#3a3550] text-[#EDE6D6] rounded px-1.5">{ch}×{n}</button>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <button onClick={() => setSacrificing(t.id)} className="border border-[#C9A227] text-[#C9A227] rounded px-2 py-0.5">承諾</button>
+                  <button onClick={() => decline(t.id)} className="border border-[#3a3550] text-[#8b8578] rounded px-2 py-0.5">拒否</button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {outgoing.length > 0 && (
+        <div className="mb-3 text-[#8b8578]">送信済み: {outgoing.map((t) => `${room.players[t.toIdx].name}へ(${t.giveChar}→${t.wantChar})`).join(", ")}</div>
+      )}
+
+      <div className="max-h-32 overflow-y-auto border border-[#3a3550] rounded p-2 mb-2 space-y-1">
+        {chatLog.length === 0 && <div className="text-[#6b6558]">まだメッセージがありません</div>}
+        {chatLog.map((m, i) => (
+          <div key={i} className={m.from === "system" ? "text-[#8b8578] italic" : "text-[#EDE6D6]"}>
+            {m.from !== "system" && <span className="text-[#C9A227]">{m.from}: </span>}{m.text}
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-2">
+        <input value={chatText} onChange={(e) => setChatText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && sendChat()} placeholder="メッセージを入力" className="flex-1 bg-[#100E17] text-[#EDE6D6] border border-[#3a3550] rounded px-2 py-1" />
+        <button onClick={sendChat} className="border border-[#C9A227] text-[#C9A227] rounded px-3">送信</button>
+      </div>
+    </div>
+  );
+}
+
 function OnlineGame({ onExit }) {
   const [stage, setStage] = useState("home"); // home | lobby | playing | gameover
   const [code, setCode] = useState(null);
@@ -882,7 +1191,7 @@ function OnlineGame({ onExit }) {
   const [room, setRoom] = useState(null);
   const unsubRef = useRef(null);
   const processedTurnRef = useRef(-1);
-  const [log, setLog] = useState("");
+  const submittedSetRef = useRef(-1);
 
   const fetchRoom = async (c) => {
     try {
@@ -896,7 +1205,6 @@ function OnlineGame({ onExit }) {
   };
 
   const stopWatching = () => { if (unsubRef.current) { unsubRef.current(); unsubRef.current = null; } };
-
   const startWatching = async (c) => {
     stopWatching();
     await ensureAuth();
@@ -904,7 +1212,6 @@ function OnlineGame({ onExit }) {
       if (snap.exists()) setRoom(snap.val());
     });
   };
-
   useEffect(() => () => stopWatching(), []);
 
   const handleCreate = async ({ count, name, book }) => {
@@ -921,7 +1228,7 @@ function OnlineGame({ onExit }) {
     if (!r || r.status !== "lobby") return false;
     const emptyIdx = r.players.findIndex((p) => !p);
     if (emptyIdx === -1) return false;
-    const fresh = await fetchRoom(c); // re-fetch to reduce race window
+    const fresh = await fetchRoom(c);
     if (!fresh || fresh.players[emptyIdx]) return false;
     fresh.players[emptyIdx] = { name, book, joined: true };
     await writeRoom(c, fresh);
@@ -933,13 +1240,13 @@ function OnlineGame({ onExit }) {
   const handleStart = async () => {
     const hp = 50 * room.count;
     const players = room.players.map((p) => makePlayer(p.name, p.book, hp));
-    const next = { ...room, status: "playing", players, activeIdx: 0, turnNumber: 0, log: "対戦開始", slotsLeft: aliveCount(players), globalDebuff: 0 };
+    const next = { ...room, status: "playing", players, activeIdx: 0, turnNumber: 0, setNumber: 1, baseMaxHp: hp, log: "対戦開始", slotsLeft: aliveCount(players), globalDebuff: 0, awaitingPick: false, setTransition: null, chatLog: [], trades: [] };
     processedTurnRef.current = -1;
     await writeRoom(code, next);
     setRoom(next);
   };
 
-  // Process my own turn-start step (stun-skip or letter draw) exactly once per turnNumber.
+  // Turn-start step: stun-skip or draw, exactly once per turnNumber. After drawing, await the bonus letter pick.
   useEffect(() => {
     if (!room || room.status !== "playing") return;
     if (room.activeIdx !== mySlot) return;
@@ -959,27 +1266,77 @@ function OnlineGame({ onExit }) {
         setRoom(next);
       } else {
         list[mySlot] = drawForPlayer(p);
-        const next = { ...room, players: list };
+        const next = { ...room, players: list, awaitingPick: true };
         await writeRoom(code, next);
         setRoom(next);
       }
     })();
   }, [room, mySlot, code]);
 
+  const onLetterPick = async (ch) => {
+    const fresh = (await fetchRoom(code)) || room;
+    const list = fresh.players.map((p, i) => (i === mySlot ? { ...p, letters: { ...p.letters, [ch]: (p.letters[ch] || 0) + 1 } } : p));
+    await writeRoom(code, { ...fresh, players: list, awaitingPick: false });
+  };
+
+  const startSetTransition = async (list, deadNames) => {
+    const survivors = list.map((p, i) => i).filter((i) => list[i].hp > 0);
+    const next = { ...room, players: list, status: "setTransition", setTransition: { survivors, keptSubmitted: {} }, log: `${deadNames}が力尽きた → 次のセットへ` };
+    await writeRoom(code, next); setRoom(next);
+  };
+
+  const submitKept = async (kept) => {
+    const fresh = (await fetchRoom(code)) || room;
+    const st = fresh.setTransition || { survivors: [], keptSubmitted: {} };
+    const nextSubmitted = { ...st.keptSubmitted, [mySlot]: kept };
+    let next = { ...fresh, setTransition: { ...st, keptSubmitted: nextSubmitted } };
+    await writeRoom(code, next); setRoom(next);
+  };
+
+  // Once everyone has submitted, the lowest-indexed survivor finalizes the new set.
+  useEffect(() => {
+    if (!room || room.status !== "setTransition" || !room.setTransition) return;
+    const { survivors, keptSubmitted } = room.setTransition;
+    const allSubmitted = survivors.every((i) => keptSubmitted[i] !== undefined);
+    if (!allSubmitted) return;
+    const leader = Math.min(...survivors);
+    if (mySlot !== leader) return;
+    if (submittedSetRef.current === room.setNumber) return;
+    submittedSetRef.current = room.setNumber;
+
+    (async () => {
+      const fresh = (await fetchRoom(code)) || room;
+      const st = fresh.setTransition;
+      const list = fresh.players.map((p, i) => {
+        if (p.hp <= 0) return p;
+        const keptList = st.keptSubmitted[i] ? Object.entries(st.keptSubmitted[i]).flatMap(([ch, n]) => Array(n).fill(ch)) : [];
+        const kept = selectKeptLetters(p.letters, keptList);
+        return resetPlayerForNewSet(p, fresh.baseMaxHp, kept);
+      });
+      const firstIdx = list.map((p, i) => i).find((i) => list[i].hp > 0);
+      processedTurnRef.current = -1;
+      const next = { ...fresh, players: list, status: "playing", activeIdx: firstIdx, turnNumber: (fresh.turnNumber || 0) + 1, setNumber: (fresh.setNumber || 1) + 1, slotsLeft: aliveCount(list), globalDebuff: 0, awaitingPick: false, setTransition: null, log: "新しいセットが始まった" };
+      await writeRoom(code, next); setRoom(next);
+    })();
+  }, [room, mySlot, code]);
+
   const finishTurn = async (list, msg, hasExtraTurn, globalDebuffImmuneRounds) => {
-    if (aliveCount(list) <= 1) {
+    const prevAlive = aliveCount(room.players);
+    const newAlive = aliveCount(list);
+    if (newAlive <= 1) {
       const next = { ...room, players: list, status: "gameover", log: msg, globalDebuff: globalDebuffImmuneRounds };
       await writeRoom(code, next); setRoom(next); return;
+    }
+    if (newAlive < prevAlive) {
+      const deadNames = room.players.filter((p, i) => p.hp > 0 && list[i].hp <= 0).map((p) => p.name).join("・");
+      await startSetTransition(list, deadNames);
+      return;
     }
     if (hasExtraTurn) {
       const next = { ...room, players: list, log: msg, globalDebuff: globalDebuffImmuneRounds };
       await writeRoom(code, next); setRoom(next); return;
     }
     const r = consumeSlot(list, globalDebuffImmuneRounds, room.slotsLeft || aliveCount(list));
-    if (aliveCount(r.list) <= 1) {
-      const next = { ...room, players: r.list, status: "gameover", log: msg, globalDebuff: r.globalDebuffImmuneRounds, slotsLeft: r.slotsLeft };
-      await writeRoom(code, next); setRoom(next); return;
-    }
     const ni = nextAliveIndex(r.list, room.activeIdx);
     const next = { ...room, players: r.list, activeIdx: ni, turnNumber: room.turnNumber + 1, slotsLeft: r.slotsLeft, globalDebuff: r.globalDebuffImmuneRounds, log: msg + (r.roundNote ? " / " + r.roundNote : "") };
     await writeRoom(code, next); setRoom(next);
@@ -1014,17 +1371,41 @@ function OnlineGame({ onExit }) {
     return <GameOverScreen winner={alive.length === 1 ? alive[0] : null} restartLabel="ホームに戻る" onRestart={() => { stopWatching(); onExit(); }} />;
   }
 
-  const isMyTurn = room.activeIdx === mySlot;
+  if (room.status === "setTransition") {
+    const st = room.setTransition;
+    const amSurvivor = st.survivors.includes(mySlot);
+    if (!amSurvivor) {
+      return <div className="min-h-screen bg-[#0A0910] text-[#8b8578] flex items-center justify-center text-sm tracking-widest px-4 text-center">{room.log}<br />生存者が次のセットの準備をしています…</div>;
+    }
+    if (st.keptSubmitted[mySlot] !== undefined) {
+      return <div className="min-h-screen bg-[#0A0910] text-[#8b8578] flex items-center justify-center text-sm tracking-widest">他のプレイヤーの選択を待っています…</div>;
+    }
+    const p = room.players[mySlot];
+    const needsPick = Object.values(p.letters).reduce((a, b) => a + b, 0) > 20;
+    if (!needsPick) {
+      submitKept({});
+      return <div className="min-h-screen bg-[#0A0910] text-[#8b8578] flex items-center justify-center text-sm tracking-widest">{room.log}<br />文字を持ち越しています…</div>;
+    }
+    return <LetterKeepScreen book={BOOKS[p.book]} player={p} onConfirm={submitKept} />;
+  }
+
+  if (room.awaitingPick && room.activeIdx === mySlot) {
+    return <LetterPickerScreen book={BOOKS[room.players[mySlot].book]} player={room.players[mySlot]} onPick={onLetterPick} />;
+  }
+
+  const isMyTurn = room.activeIdx === mySlot && !room.awaitingPick;
   const me = room.players[mySlot];
   const others = room.players.map((p, i) => ({ ...p, idx: i })).filter((p) => p.idx !== mySlot && p.hp > 0 && !(p.untargetableRounds > 0));
   const activeName = room.players[room.activeIdx]?.name;
 
   return (
     <div className="min-h-screen w-full bg-[#0A0910] px-4 py-6">
+      <div className="text-center text-[10px] text-[#8b8578] mb-1 tracking-widest">セット {room.setNumber || 1}</div>
       {(room.globalDebuff || 0) > 0 && <div className="text-center text-xs text-[#C9A227] mb-2 tracking-widest">全体デバフ無効化中(残り{room.globalDebuff}巡)</div>}
       <HpStrip players={room.players} highlightIdx={room.activeIdx} />
       {!isMyTurn && <div className="text-center text-xs text-[#8b8578] mb-3 tracking-widest">{activeName} のターンです…</div>}
       <GrimoirePanel key={mySlot} player={me} others={others} isInteractive={isMyTurn} silenced={me.silencedTurns > 0} onCast={onCast} onPass={onPass} log={room.log} />
+      <ChatTradePanel room={room} mySlot={mySlot} code={code} fetchRoom={fetchRoom} writeRoom={writeRoom} others={others} />
     </div>
   );
 }
